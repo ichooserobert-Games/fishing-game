@@ -1,0 +1,388 @@
+<!doctype html><!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <title>Kid Fishing (iPhone)</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b1220; color:#e8eefc; font-family:-apple-system, system-ui, Arial; }
+    canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  addEventListener("resize", resize, { passive:true });
+  resize();
+
+  // Rounded rect helper
+  function roundRect(x, y, w, h, r) {
+    r = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
+  const state = {
+    holding:false,
+    tension:0.35,
+    progress:0,
+    fishPhase:"rest",
+    phaseT:0,
+    level:1,
+    coins:0,
+    hearts:3,
+    message:"Hold REEL when it bites",
+    msgT:2,
+    looseT:0,
+    tightT:0,
+    stage:"bite",  // bite | hooked | caught
+    biteT:0,
+    biteWindow:0.9,
+    biteNow:false,
+    // iPhone: big reel button region (calculated each draw)
+    reelBtn:null
+  };
+
+  function setMessage(text, seconds=2.0){ state.message=text; state.msgT=seconds; }
+
+  function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+  function getTuning(level){
+    const greenSize = level===1 ? 0.58 : level===2 ? 0.48 : 0.38;
+    const catchSeconds = level===1 ? 5.5 : level===2 ? 6.5 : 7.5;
+    return {
+      reelUp: 0.95,
+      relaxDown: 0.75,
+      pullMin: level===1 ? 0.05 : 0.10,
+      pullMax: level===1 ? 0.60 : level===2 ? 0.80 : 1.00,
+      wiggleAmp: level===1 ? 0.02 : level===2 ? 0.03 : 0.045,
+      greenLow: 0.5 - greenSize/2,
+      greenHigh: 0.5 + greenSize/2,
+      looseFail: 3.0,
+      tightFail: 2.0,
+      progressRate: 1.0 / catchSeconds
+    };
+  }
+  let tuning = getTuning(state.level);
+
+  function updateBite(dt){
+    state.biteT += dt;
+    if(!state.biteNow){
+      const next = 2.0 + Math.random()*2.2;
+      if(state.biteT >= next){
+        state.biteT = 0;
+        state.biteNow = true;
+        state.biteWindow = 0.75 + Math.random()*0.9;
+        setMessage("BITE! Hold REEL now!", 1.1);
+        if(navigator.vibrate) navigator.vibrate(25);
+      }
+    } else {
+      state.biteWindow -= dt;
+      if(state.biteWindow <= 0){
+        state.biteNow = false;
+        setMessage("Missed it. Wait for the next bite.", 1.4);
+      }
+    }
+  }
+
+  function updateFishBehavior(dt){
+    state.phaseT -= dt;
+    if(state.phaseT <= 0){
+      const r = Math.random();
+      state.fishPhase = r < 0.45 ? "rest" : r < 0.80 ? "pull" : "wiggle";
+      state.phaseT = state.fishPhase==="rest" ? (0.8+Math.random()*0.8)
+                   : state.fishPhase==="pull" ? (0.6+Math.random()*0.7)
+                   : (0.35+Math.random()*0.55);
+    }
+  }
+
+  function loseFish(reason){
+    state.hearts -= 1;
+    state.stage = "bite";
+    state.biteNow = false;
+    state.biteT = 0;
+    state.tension = 0.35;
+    state.progress = 0;
+    state.looseT = 0;
+    state.tightT = 0;
+
+    if(state.hearts > 0){
+      setMessage(reason + " (-1 heart)", 1.8);
+    } else {
+      state.hearts = 3;
+      state.coins = 0;
+      state.level = 1;
+      tuning = getTuning(state.level);
+      setMessage(reason + " Reset! Try again!", 2.2);
+    }
+  }
+
+  function catchFish(){
+    state.stage = "caught";
+    const reward = 6 + state.level*3;
+    state.coins += reward;
+    setMessage("Caught! +" + reward + " coins", 2.0);
+
+    if(state.coins >= 30 && state.level === 1){
+      state.level = 2; tuning = getTuning(state.level); setMessage("Level up! Level 2", 2.0);
+    } else if(state.coins >= 70 && state.level === 2){
+      state.level = 3; tuning = getTuning(state.level); setMessage("Level up! Level 3", 2.0);
+    }
+
+    setTimeout(()=>{
+      state.stage = "bite";
+      state.biteNow = false;
+      state.biteT = 0;
+      state.tension = 0.35;
+      state.progress = 0;
+      state.looseT = 0;
+      state.tightT = 0;
+      setMessage("Wait for a biteâ¦ then hold REEL", 1.5);
+    }, 850);
+  }
+
+  // Input handling: allow hold anywhere, but prefer big REEL button
+  function pointerDown(e){
+    e.preventDefault();
+    const x = e.clientX, y = e.clientY;
+
+    // If a reel button exists and the tap is inside, treat as holding
+    if(state.reelBtn && x >= state.reelBtn.x && x <= state.reelBtn.x+state.reelBtn.w &&
+       y >= state.reelBtn.y && y <= state.reelBtn.y+state.reelBtn.h){
+      state.holding = true;
+    } else {
+      // Still allow anywhere for tiny hands
+      state.holding = true;
+    }
+
+    // Hook action: only when biteNow is true
+    if(state.stage==="bite" && state.biteNow){
+      state.stage="hooked";
+      state.biteNow=false;
+      state.progress=0;
+      state.looseT=0;
+      state.tightT=0;
+      state.fishPhase="rest";
+      state.phaseT=0;
+      setMessage("Hooked! Keep it in the green!", 1.8);
+    }
+  }
+
+  function pointerUp(e){ e.preventDefault(); state.holding=false; }
+
+  canvas.addEventListener("pointerdown", pointerDown, { passive:false });
+  canvas.addEventListener("pointerup", pointerUp, { passive:false });
+  canvas.addEventListener("pointercancel", pointerUp, { passive:false });
+  canvas.addEventListener("pointerleave", pointerUp, { passive:false });
+
+  document.addEventListener("gesturestart", (e)=>e.preventDefault(), { passive:false });
+
+  let last = performance.now();
+  function tick(now){
+    const dt = Math.min(0.033, (now-last)/1000);
+    last = now;
+
+    if(state.msgT > 0) state.msgT -= dt;
+
+    if(state.stage==="bite"){
+      updateBite(dt);
+      state.tension = clamp01(state.tension + Math.sin(now/650)*0.0007);
+    } else if(state.stage==="hooked"){
+      updateFishBehavior(dt);
+
+      const reelDelta = state.holding ? tuning.reelUp : -tuning.relaxDown;
+      state.tension += reelDelta * dt;
+
+      if(state.fishPhase==="pull"){
+        const pull = tuning.pullMin + Math.random()*(tuning.pullMax - tuning.pullMin);
+        state.tension += pull * dt;
+      } else if(state.fishPhase==="wiggle"){
+        const bump = (Math.random()*2 - 0.4) * tuning.wiggleAmp;
+        state.tension += bump;
+      }
+
+      state.tension = clamp01(state.tension);
+
+      const inGreen = state.tension >= tuning.greenLow && state.tension <= tuning.greenHigh;
+      if(inGreen){
+        state.progress = clamp01(state.progress + tuning.progressRate*dt);
+      } else {
+        state.progress = clamp01(state.progress - 0.09*dt);
+      }
+
+      if(state.tension < tuning.greenLow) state.looseT += dt; else state.looseT = Math.max(0, state.looseT - 2*dt);
+      if(state.tension > tuning.greenHigh) state.tightT += dt; else state.tightT = Math.max(0, state.tightT - 2*dt);
+
+      if(state.tightT >= tuning.tightFail) loseFish("Too tight!");
+      else if(state.looseT >= tuning.looseFail) loseFish("Too loose!");
+      else if(state.progress >= 1.0) catchFish();
+    }
+
+    draw(now);
+    requestAnimationFrame(tick);
+  }
+
+  function draw(now){
+    const w = innerWidth, h = innerHeight;
+
+    // Background
+    const bg = ctx.createLinearGradient(0,0,0,h);
+    bg.addColorStop(0, "#071024");
+    bg.addColorStop(1, "#082a3a");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0,0,w,h);
+
+    // Water
+    const waterTop = h*0.18;
+    ctx.fillStyle = "rgba(40,140,170,0.35)";
+    ctx.fillRect(0, waterTop, w, h-waterTop);
+
+    // Fish shadow (center-ish)
+    const t = now/1000;
+    const fishX = w*0.50 + Math.sin(t*0.9)*(w*0.18);
+    const fishY = waterTop + h*0.30 + Math.sin(t*1.2)*(h*0.04);
+    ctx.beginPath();
+    ctx.ellipse(fishX, fishY, w*0.06, h*0.025, 0, 0, Math.PI*2);
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.fill();
+
+    // Bobber (upper middle)
+    const bobX = w*0.50;
+    const bobY = waterTop + h*0.12 + (state.biteNow ? Math.sin(now/80)*7 : Math.sin(now/700)*3);
+    ctx.beginPath();
+    ctx.arc(bobX, bobY, Math.min(w,h)*0.018, 0, Math.PI*2);
+    ctx.fillStyle = state.biteNow ? "rgba(255,120,120,0.95)" : "rgba(255,220,120,0.95)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.55)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Top HUD
+    const pad = 14;
+    ctx.fillStyle = "rgba(10,16,28,0.45)";
+    roundRect(pad, pad, w-pad*2, 44, 14);
+    ctx.fill();
+
+    ctx.fillStyle = "rgba(232,238,252,0.95)";
+    ctx.font = "600 16px -apple-system, system-ui, Arial";
+    ctx.fillText("Level " + state.level, pad+14, pad+28);
+    ctx.fillText("Coins " + state.coins, pad+100, pad+28);
+    ctx.fillText("â¤".repeat(state.hearts), w - pad - 80, pad+28);
+
+    // Tension meter (left side, big)
+    const meterX = pad;
+    const meterY = pad + 60;
+    const meterW = Math.min(62, w*0.18);
+    const meterH = h*0.46;
+
+    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    roundRect(meterX, meterY, meterW, meterH, 12);
+    ctx.fill();
+
+    const yLow = meterY + meterH*(1 - tuning.greenLow);
+    const yHigh = meterY + meterH*(1 - tuning.greenHigh);
+
+    ctx.fillStyle = "rgba(255,80,80,0.35)";
+    ctx.fillRect(meterX, meterY, meterW, yHigh-meterY);
+
+    ctx.fillStyle = "rgba(120,255,160,0.35)";
+    ctx.fillRect(meterX, yHigh, meterW, yLow-yHigh);
+
+    ctx.fillStyle = "rgba(160,200,255,0.18)";
+    ctx.fillRect(meterX, yLow, meterW, (meterY+meterH)-yLow);
+
+    // Tension indicator
+    const ty = meterY + meterH*(1 - state.tension);
+    ctx.beginPath();
+    ctx.arc(meterX + meterW/2, ty, 10, 0, Math.PI*2);
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fill();
+
+    // Catch progress ring (right side)
+    const ringX = w - pad - 70;
+    const ringY = pad + 120;
+    const r = 46;
+    ctx.lineWidth = 10;
+    ctx.strokeStyle = "rgba(255,255,255,0.20)";
+    ctx.beginPath();
+    ctx.arc(ringX, ringY, r, 0, Math.PI*2);
+    ctx.stroke();
+
+    ctx.strokeStyle = "rgba(120,255,160,0.85)";
+    ctx.beginPath();
+    ctx.arc(ringX, ringY, r, -Math.PI/2, -Math.PI/2 + Math.PI*2*state.progress);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(232,238,252,0.95)";
+    ctx.font = "600 14px -apple-system, system-ui, Arial";
+    ctx.fillText("CATCH", ringX-22, ringY+5);
+
+    // Big REEL button (bottom-right, thumb friendly)
+    const btnW = Math.min(210, w*0.56);
+    const btnH = 80;
+    const btnX = w - pad - btnW;
+    const btnY = h - pad - btnH;
+
+    state.reelBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
+
+    // Button style
+    const btnGlow = state.holding ? 0.65 : 0.35;
+    ctx.fillStyle = `rgba(80,150,255,${btnGlow})`;
+    roundRect(btnX, btnY, btnW, btnH, 22);
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 2;
+    roundRect(btnX, btnY, btnW, btnH, 22);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.font = "700 28px -apple-system, system-ui, Arial";
+    ctx.fillText("REEL", btnX + btnW/2 - 34, btnY + 52);
+
+    ctx.font = "14px -apple-system, system-ui, Arial";
+    ctx.fillText("Hold to reel â¢ Release to relax", btnX + 18, btnY + 20);
+
+    // Message overlay (center)
+    if(state.msgT > 0){
+      const mw = Math.min(w*0.92, 360);
+      const mh = 54;
+      const mx = (w-mw)/2;
+      const my = h*0.62;
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      roundRect(mx, my, mw, mh, 16);
+      ctx.fill();
+      ctx.fillStyle = "rgba(232,238,252,0.95)";
+      ctx.font = "600 16px -apple-system, system-ui, Arial";
+      ctx.fillText(state.message, mx+16, my+34);
+    }
+
+    // Stage hint
+    ctx.fillStyle = "rgba(232,238,252,0.75)";
+    ctx.font = "14px -apple-system, system-ui, Arial";
+    const hint = state.stage==="bite"
+      ? (state.biteNow ? "Bite! Hold REEL!" : "Waiting for a biteâ¦")
+      : "Keep the dot in the green!";
+    ctx.fillText(hint, pad+meterW+12, pad+95);
+  }
+
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
